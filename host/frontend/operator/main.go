@@ -30,7 +30,7 @@ const (
 	DefaultHttpPort       = "1080"
 	DefaultHttpsPort      = "1443"
 	DefaultTLSCertDir     = "/etc/cuttlefish-common/host-orchestrator/cert"
-	DefaultStaticFilesDir = "static"    // relative path
+	DefaultStaticFilesDir = "webui"     // relative path
 	DefaultInterceptDir   = "intercept" // relative path
 )
 

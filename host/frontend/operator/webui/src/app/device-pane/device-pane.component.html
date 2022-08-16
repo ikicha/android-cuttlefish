@@ -1,0 +1,38 @@
+<div
+  class="list-pane-title"
+  style="margin: 10% auto; position: relative; text-align: center"
+>
+  Devices
+  <span id="refresh-list" title="Refresh list" (click)="onRefresh()"
+    >&#8635;</span
+  >
+</div>
+<div>
+  <ul class="devices">
+    <section class="device-list">
+      <li *ngFor="let device of devices | async">
+        <!--Implemented with checkbox, not radio button as current page-->
+        <mat-checkbox
+          class="checkbox"
+          [(ngModel)]="device.isVisible"
+          (change)="onSelect(device)"
+          >{{ device.id }}</mat-checkbox
+        >
+        <a
+          href="{{ '/devices/' + device.id + '/files/client.html' }}"
+          title="Launch in new tab"
+          target="_blank"
+        >
+          <button mat-icon-button id="pop-up">
+            <mat-icon>open_in_new</mat-icon>
+          </button>
+        </a>
+      </li>
+    </section>
+  </ul>
+</div>
+<div>
+  <button mat-raised-button class="show-all" (click)="showAll()">
+    Show All
+  </button>
+</div>

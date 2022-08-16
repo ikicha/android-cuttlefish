@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"sync"
+	"sync/atomic"
 
 	apiv1 "cuttlefish/liboperator/api/v1"
 	"cuttlefish/liboperator/operator"
@@ -121,6 +122,7 @@ type LaunchCVDProcedureBuilder struct {
 	stageCreateHomesDir     *StageCreateDirIfNotExist
 	stageFetchCVDMap        map[string]*StageFetchCVD
 	stageFetchCVDMapMutex   sync.Mutex
+	instanceNumberCounter   uint32
 }
 
 func NewLaunchCVDProcedureBuilder(
@@ -135,7 +137,8 @@ func NewLaunchCVDProcedureBuilder(
 			Downloader: NewCVDDownloader(NewSignedURLArtifactDownloader(http.DefaultClient, abURL)),
 		},
 		stageStartCVDServer: &StageStartCVDServer{
-			StartCVDServerCmd: &CVDSubcmdStartCVDServer{CVDBin: paths.CVDBin},
+			ExecContext: exec.Command,
+			CVDBin:      paths.CVDBin,
 		},
 		stageCreateArtifactsDir: &StageCreateDirIfNotExist{Dir: paths.ArtifactsRootDir},
 		stageCreateHomesDir:     &StageCreateDirIfNotExist{Dir: paths.HomesRootDir},
@@ -148,34 +151,49 @@ func (b *LaunchCVDProcedureBuilder) Build(input interface{}) Procedure {
 	if !ok {
 		panic("invalid type")
 	}
+	instanceNumber := atomic.AddUint32(&b.instanceNumberCounter, 1)
+	artifactsDir :=
+		fmt.Sprintf("%s/%s_%s", b.paths.ArtifactsRootDir, req.BuildInfo.BuildID, req.BuildInfo.Target)
+	homeDir := fmt.Sprintf("%s/cvd-%d", b.paths.HomesRootDir, instanceNumber)
 	return Procedure{
 		b.stageDownloadCVD,
 		b.stageStartCVDServer,
 		b.stageCreateArtifactsDir,
-		&StageCreateDirIfNotExist{
-			Dir: buildArtifactsDir(b.paths.ArtifactsRootDir, *req.BuildInfo),
-		},
-		b.buildFetchCVDStage(req.BuildInfo),
+		&StageCreateDirIfNotExist{Dir: artifactsDir},
+		b.buildFetchCVDStage(req.BuildInfo, artifactsDir),
 		b.stageCreateHomesDir,
+		&StageCreateDirIfNotExist{Dir: homeDir},
+		b.buildLaunchCVDStage(instanceNumber, artifactsDir, homeDir),
 	}
 }
 
-func (b *LaunchCVDProcedureBuilder) buildFetchCVDStage(info *apiv1.BuildInfo) *StageFetchCVD {
+func (b *LaunchCVDProcedureBuilder) buildFetchCVDStage(
+	info *apiv1.BuildInfo, outDir string) *StageFetchCVD {
 	b.stageFetchCVDMapMutex.Lock()
 	defer b.stageFetchCVDMapMutex.Unlock()
 	key := fmt.Sprintf("%s_%s", info.BuildID, info.Target)
 	value := b.stageFetchCVDMap[key]
 	if value == nil {
 		value = &StageFetchCVD{
-			FetchCVDCmd: &FetchCVDCmd{
-				ExecContext: exec.Command,
-				Paths:       b.paths,
-				BuildInfo:   *info,
-			},
+			ExecContext: exec.Command,
+			CVDBin:      b.paths.CVDBin,
+			BuildInfo:   *info,
+			OutDir:      outDir,
 		}
 		b.stageFetchCVDMap[key] = value
 	}
 	return value
+}
+
+func (b *LaunchCVDProcedureBuilder) buildLaunchCVDStage(
+	instanceNumber uint32, artifactsDir, homeDir string) *StageLaunchCVD {
+	return &StageLaunchCVD{
+		ExecContext:    exec.Command,
+		CVDBin:         b.paths.CVDBin,
+		InstanceNumber: instanceNumber,
+		ArtifactsDir:   artifactsDir,
+		HomeDir:        homeDir,
+	}
 }
 
 type StageDownloadCVD struct {
@@ -191,10 +209,18 @@ func (s *StageDownloadCVD) Run() error {
 	return s.Downloader.Download(s.CVDBin, s.Build)
 }
 
+type ExecContext = func(name string, arg ...string) *exec.Cmd
+
+const (
+	envVarAndroidHostOut = "ANDROID_HOST_OUT"
+	envVarHome           = "HOME"
+)
+
 type StageStartCVDServer struct {
-	StartCVDServerCmd StartCVDServerCmd
-	mutex             sync.Mutex
-	completed         bool
+	ExecContext ExecContext
+	CVDBin      string
+	mutex       sync.Mutex
+	completed   bool
 }
 
 func (s *StageStartCVDServer) Run() error {
@@ -203,7 +229,17 @@ func (s *StageStartCVDServer) Run() error {
 	if s.completed {
 		return nil
 	}
-	err := s.StartCVDServerCmd.Run(exec.Command)
+	cmd := s.ExecContext(s.CVDBin)
+	cmd.Env = []string{fmt.Sprintf("%s=", envVarAndroidHostOut)}
+	// NOTE: Stdout and Stderr should be nil so Run connects the corresponding
+	// file descriptor to the null device (os.DevNull).
+	// Otherwhise, `Run` will never complete. Why? a pipe will be created to handle
+	// the data of the new process, this pipe will be passed over to `cvd_server`,
+	// which is a daemon, hence the pipe will never reach EOF and Run will never
+	// complete. Read more about it here: https://cs.opensource.google/go/go/+/refs/tags/go1.18.3:src/os/exec/exec.go;l=108-111
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	err := cmd.Run()
 	if err == nil {
 		s.completed = true
 	}
@@ -225,7 +261,10 @@ func (s *StageCreateDirIfNotExist) Run() error {
 }
 
 type StageFetchCVD struct {
-	FetchCVDCmd *FetchCVDCmd
+	ExecContext ExecContext
+	CVDBin      string
+	BuildInfo   apiv1.BuildInfo
+	OutDir      string
 	mutex       sync.Mutex
 	completed   bool
 }
@@ -236,7 +275,11 @@ func (s *StageFetchCVD) Run() error {
 	if s.completed {
 		return nil
 	}
-	stdoutStderr, err := s.FetchCVDCmd.Run()
+	buildArg := fmt.Sprintf("--default_build=%s/%s", s.BuildInfo.BuildID, s.BuildInfo.Target)
+	dirArg := fmt.Sprintf("--directory=%s", s.OutDir)
+	cmd := s.ExecContext(s.CVDBin, "fetch", buildArg, dirArg)
+	cmd.Env = []string{fmt.Sprintf("%s=", envVarAndroidHostOut)}
+	stdoutStderr, err := cmd.CombinedOutput()
 	// NOTE: The stage is only completed when no error occurs. It's ok for this
 	// stage to be retried if an error happened before.
 	if err == nil {
@@ -245,6 +288,41 @@ func (s *StageFetchCVD) Run() error {
 		log.Printf("`cvd fetch` failed with combined stdout and stderr: %q", string(stdoutStderr))
 	}
 	return err
+}
+
+const (
+	daemonArg = "--daemon"
+	// TODO(b/242599859): Add report_anonymous_usage_stats as a parameter to the Create CVD API.
+	reportAnonymousUsageStatsArg = "--report_anonymous_usage_stats=y"
+)
+
+type StageLaunchCVD struct {
+	ExecContext    ExecContext
+	CVDBin         string
+	InstanceNumber uint32
+	ArtifactsDir   string
+	HomeDir        string
+}
+
+func (s *StageLaunchCVD) Run() error {
+	instanceNumArg := fmt.Sprintf("--base_instance_num=%d", s.InstanceNumber)
+	imgDirArg := fmt.Sprintf("--system_image_dir=%s", s.ArtifactsDir)
+	cmd := s.ExecContext(s.CVDBin, "start",
+		daemonArg,
+		reportAnonymousUsageStatsArg,
+		instanceNumArg,
+		imgDirArg,
+	)
+	cmd.Env = append(os.Environ(),
+		fmt.Sprintf("%s=%s", envVarAndroidHostOut, s.ArtifactsDir),
+		fmt.Sprintf("%s=%s", envVarHome, s.HomeDir),
+	)
+	stdoutStderr, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("`cvd start` failed with combined stdout and stderr: %s", string(stdoutStderr))
+		return fmt.Errorf("launch cvd stage failed: %w", err)
+	}
+	return nil
 }
 
 type CVDDownloader struct {
@@ -368,54 +446,4 @@ func BuildGetSignedURL(baseURL string, build AndroidBuild, name string) string {
 		"latest",
 		name)
 	return baseURL + uri
-}
-
-const envVarAndroidHostOut = "ANDROID_HOST_OUT"
-
-type ExecContext = func(name string, arg ...string) *exec.Cmd
-
-type StartCVDServerCmd interface {
-	Run(execContext ExecContext) error
-}
-
-type CVDSubcmdStartCVDServer struct {
-	CVDBin string
-}
-
-func (c *CVDSubcmdStartCVDServer) Run(execContext ExecContext) error {
-	if err := os.Setenv("ANDROID_HOST_OUT", ""); err != nil {
-		return err
-	}
-	cmd := execContext(c.CVDBin)
-	// NOTE: Stdout and Stderr should be nil so Run connects the corresponding
-	// file descriptor to the null device (os.DevNull).
-	// Otherwhise, `Run` will never complete. Why? a pipe will be created to handle
-	// the data of the new process, this pipe will be passed over to `cvd_server`,
-	// which is a daemon, hence the pipe will never reach EOF and Run will never
-	// complete. Read more about it here: https://cs.opensource.google/go/go/+/refs/tags/go1.18.3:src/os/exec/exec.go;l=108-111
-	cmd.Stdout = nil
-	cmd.Stderr = nil
-	return cmd.Run()
-}
-
-type FetchCVDCmd struct {
-	ExecContext ExecContext
-	Paths       IMPaths
-	BuildInfo   apiv1.BuildInfo
-}
-
-// Runs the command and returns its combined standard output and standard error.
-func (c *FetchCVDCmd) Run() ([]byte, error) {
-	outDir := buildArtifactsDir(c.Paths.ArtifactsRootDir, c.BuildInfo)
-	if err := os.Setenv("ANDROID_HOST_OUT", outDir); err != nil {
-		return nil, err
-	}
-	buildFlag := fmt.Sprintf("--default_build=%s/%s", c.BuildInfo.BuildID, c.BuildInfo.Target)
-	dirFlag := fmt.Sprintf("--directory=%s", outDir)
-	cmd := c.ExecContext(c.Paths.CVDBin, "fetch", buildFlag, dirFlag)
-	return cmd.CombinedOutput()
-}
-
-func buildArtifactsDir(baseDir string, info apiv1.BuildInfo) string {
-	return fmt.Sprintf("%s/%s_%s", baseDir, info.BuildID, info.Target)
 }

@@ -1,0 +1,37 @@
+<button mat-icon-button class="close" [mat-dialog-close]="true">
+  <mat-icon color="warn">close</mat-icon>
+</button>
+
+<h2>Add new device</h2>
+<mat-form-field appearance="outline" class="input">
+  <mat-label>Build ID</mat-label>
+  <input
+    matInput
+    [disabled]="inProgress"
+    [(ngModel)]="buildId"
+    cdkFocusInitial />
+</mat-form-field>
+<mat-form-field appearance="outline" class="input input-target">
+  <mat-label>Target</mat-label>
+  <input matInput [disabled]="inProgress" [(ngModel)]="targetName" />
+</mat-form-field>
+<mat-form-field appearance="outline" class="input">
+  <mat-label>Instance Count</mat-label>
+  <input
+    matInput
+    type="number"
+    [disabled]="inProgress"
+    [(ngModel)]="instancesCount" />
+</mat-form-field>
+
+<div class="bottom">
+  <p class='error' *ngIf="errorMessage"><b>{{errorMessage}}</b></p>
+  <button
+    mat-raised-button
+    [disabled]="inProgress"
+    color="primary"
+    (click)="onClickedCreate()">
+    <mat-icon *ngIf="inProgress"><mat-spinner [diameter]="20"></mat-spinner></mat-icon>
+    Create
+  </button>
+</div>

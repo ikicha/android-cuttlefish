@@ -1,9 +1,22 @@
 import {Injectable, SecurityContext} from '@angular/core';
-import {map, Observable, ReplaySubject, Subject} from 'rxjs';
-import {HttpClient} from '@angular/common/http';
+import {HttpClient, HttpErrorResponse} from '@angular/common/http';
 import {Device} from './device-interface';
 import {DeviceInfo} from './device-info-interface';
 import {DomSanitizer} from '@angular/platform-browser';
+import {
+  catchError,
+  filter,
+  interval,
+  map,
+  mergeMap,
+  of,
+  Observable,
+  ReplaySubject,
+  Subject,
+  takeWhile,
+} from 'rxjs';
+
+import {Operation} from './operation-interface';
 
 @Injectable({
   providedIn: 'root',
@@ -11,6 +24,15 @@ import {DomSanitizer} from '@angular/platform-browser';
 export class DeviceService {
   private devicesSubject: Subject<Device[]> = new ReplaySubject<Device[]>(1);
   private devicesObservable = this.devicesSubject.asObservable();
+  private operationTimedOutError: Operation = {
+    name: '',
+    done: true,
+    result: {
+      error: {
+        error: 'Operation timed out',
+      },
+    },
+  };
 
   constructor(
     private readonly httpClient: HttpClient,
@@ -39,6 +61,63 @@ export class DeviceService {
 
   createDevice(deviceId: string): Device {
     return new Device(deviceId, this.deviceConnectURL(deviceId));
+  }
+
+  httpErrorHandler(err: HttpErrorResponse) {
+    let errorMessage = '';
+
+    if (err && err.error && err.error.message) {
+      errorMessage = err.error.message;
+    } else {
+      errorMessage = err.message;
+    }
+
+    return of({
+      name: '',
+      done: true,
+      result: {
+        error: {
+          error: 'HTTP Error: ' + errorMessage,
+        },
+      },
+    });
+  }
+
+  requestNewDevice(
+    buildId: string,
+    target: string,
+    instancesCount: number
+  ): Observable<Operation> {
+    const timeOut = 300;
+
+    return this.httpClient
+      .post<Operation>('./devices', {
+        build_info: {build_id: buildId, target: target},
+        instances_count: instancesCount,
+      })
+      .pipe(
+        catchError(this.httpErrorHandler),
+        mergeMap(operationInfo => {
+          if (operationInfo.done) {
+            return of(operationInfo);
+          }
+
+          return interval(1000).pipe(
+            catchError(this.httpErrorHandler),
+            mergeMap(currentTime => {
+              if (currentTime >= timeOut) {
+                return of(this.operationTimedOutError);
+              }
+
+              return this.httpClient.get<Operation>(
+                './operations/' + operationInfo.name
+              );
+            })
+          );
+        }),
+        takeWhile(operationInfo => !operationInfo.done, true),
+        filter(operationInfo => operationInfo.done)
+      );
   }
 
   getDevices() {
